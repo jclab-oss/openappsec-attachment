@@ -26,8 +26,10 @@ function NanoHandler.access(conf)
     
     ctx.session_data = session_data
     ctx.session_id = session_id
-    if nano.is_session_finalized(session_id) then
+    ctx.session_finalized = false
+    if nano.is_session_finalized(ctx.session_data) then
         kong.log.debug("Session has already been inspected, no need for further inspection")
+        ctx.session_finalized = true
         return
     end
 
@@ -140,8 +142,14 @@ end
 
 function NanoHandler.header_filter(conf)
     local ctx = kong.ctx.plugin
+    if ctx.session_finalized then
+        kong.log.debug("Session has already been finalized, no need for further inspection")
+        return
+    end
+
     if nano.is_session_finalized(ctx.session_data) then
         kong.log.debug("Session has already been inspected, no need for further inspection")
+        ctx.session_finalized = true
         return
     end
 
@@ -188,9 +196,15 @@ function NanoHandler.body_filter(conf)
     
     local session_id = ctx.session_id
     local session_data = ctx.session_data
+
+    if ctx.session_finalized then
+        kong.log.debug("Session has already been finalized, no need for further inspection")
+        return
+    end
     
     if nano.is_session_finalized(session_data) then
         kong.log.debug("Session has already been inspected, no need for further inspection")
+        ctx.session_finalized = true
         return
     end
     
@@ -261,8 +275,12 @@ end
 
 function NanoHandler.log(conf)
     local ctx = kong.ctx.plugin
-    if ctx.cleanup_needed then
+    if not ctx.session_finalized then
+        kong.log.debug("Finalizing session in log phase")
         nano.fini_session(ctx.session_data)
+        ctx.session_finalized = true
+    end
+    if ctx.cleanup_needed then
         nano.cleanup_all()
         ctx.session_data = nil
         ctx.session_id = nil
