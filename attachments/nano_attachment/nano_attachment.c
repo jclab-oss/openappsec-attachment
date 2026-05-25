@@ -199,6 +199,7 @@ InitNanoAttachment(uint8_t attachment_type, int worker_id, int num_of_workers, i
     attachment->inspection_mode = NON_BLOCKING_THREAD;
     attachment->num_of_nano_ipc_elements = 200;
     attachment->keep_alive_interval_msec = DEFAULT_KEEP_ALIVE_INTERVAL_MSEC;
+    attachment->paired_affinity_enabled = 0;
     attachment->is_async_mode_enabled = 0;
     memset(attachment->async_buckets, 0, sizeof(attachment->async_buckets));
 
@@ -760,6 +761,46 @@ GetRedirectPage(NanoAttachment *attachment, HttpSessionData *session_data, Attac
     };
 }
 
+CustomResponseWithHeaders *
+GetCustomResponseWithHeaders(
+    NanoAttachment *attachment,
+    HttpSessionData *session_data,
+    AttachmentVerdictResponse *response
+)
+{
+    WebResponseData *web_response_data = response->web_response_data;
+
+    if (web_response_data == NULL) {
+        write_dbg(
+            attachment,
+            session_data->session_id,
+            DBG_LEVEL_WARNING,
+            "Trying to get custom response with headers but no response object"
+        );
+        return NULL;
+    }
+
+    if (web_response_data->web_response_type != CUSTOM_RESPONSE_WITH_HEADERS) {
+        write_dbg(
+            attachment,
+            session_data->session_id,
+            DBG_LEVEL_WARNING,
+            "Trying to get custom response with headers but response type is %d",
+            web_response_data->web_response_type
+        );
+        return NULL;
+    }
+
+    write_dbg(
+        attachment,
+        session_data->session_id,
+        DBG_LEVEL_TRACE,
+        "Getting custom response with headers"
+    );
+
+    return (CustomResponseWithHeaders *) web_response_data->data;
+}
+
 void
 FreeAttachmentResponseContent(
     NanoAttachment *attachment,
@@ -804,11 +845,31 @@ FreeAttachmentResponseContent(
             "Freeing custom web response data"
         );
 
-        if (response->web_response_data->data != NULL){
+        // Free custom response with headers if applicable
+        if (response->web_response_data->web_response_type == CUSTOM_RESPONSE_WITH_HEADERS) {
+            CustomResponseWithHeaders *custom_resp =
+                (CustomResponseWithHeaders *)response->web_response_data->data;
+            if (custom_resp != NULL) {
+                uint8_t i;
+                if (custom_resp->headers != NULL) {
+                    for (i = 0; i < custom_resp->headers_count; i++) {
+                        if (custom_resp->headers[i].key != NULL) {
+                            free(custom_resp->headers[i].key);
+                        }
+                        if (custom_resp->headers[i].value != NULL) {
+                            free(custom_resp->headers[i].value);
+                        }
+                    }
+                    free(custom_resp->headers);
+                }
+                if (custom_resp->body != NULL) {
+                    free(custom_resp->body);
+                }
+                free(custom_resp);
+            }
+        } else {
             free(response->web_response_data->data);
-            response->web_response_data->data = NULL;
         }
-
         free(response->web_response_data);
         response->web_response_data = NULL;
     }

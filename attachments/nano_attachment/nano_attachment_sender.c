@@ -196,6 +196,9 @@ FinalizeSuccessfulResponse(
         case TRAFFIC_VERDICT_DROP:
             response.verdict = ATTACHMENT_VERDICT_DROP;
             break;
+        case TRAFFIC_VERDICT_CUSTOM_RESPONSE:
+            response.verdict = ATTACHMENT_VERDICT_DROP;
+            break;
         case TRAFFIC_VERDICT_INJECT:
             // Not yet supported
             response.verdict = ATTACHMENT_VERDICT_INSPECT;
