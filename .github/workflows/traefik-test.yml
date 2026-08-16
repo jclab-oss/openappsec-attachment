@@ -1,0 +1,67 @@
+name: traefik-test
+
+on:
+  push:
+    branches:
+      - jclab-main
+    paths:
+      - "attachments/traefik/**"
+      - "attachments/nano_attachment/**"
+      - "core/**"
+      - "docker/openappsec-traefik/**"
+      - ".github/workflows/traefik-test.yml"
+      - ".github/e2e/traefik/**"
+  pull_request:
+    paths:
+      - "attachments/traefik/**"
+      - "attachments/nano_attachment/**"
+      - "core/**"
+      - "docker/openappsec-traefik/**"
+      - ".github/workflows/traefik-test.yml"
+      - ".github/e2e/traefik/**"
+  workflow_dispatch:
+
+jobs:
+  unit-test:
+    name: Plugin unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: attachments/traefik/plugin/go.mod
+
+      - name: gofmt
+        working-directory: attachments/traefik/plugin
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: go vet
+        working-directory: attachments/traefik/plugin
+        run: go vet ./...
+
+      - name: go test
+        working-directory: attachments/traefik/plugin
+        run: go test -race -count=1 ./...
+
+  build-image:
+    name: Build image + e2e tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: |
+          docker build -f docker/openappsec-traefik/Dockerfile \
+            -t openappsec-traefik:test .
+
+      - name: Smoke test (no agent, fail-open)
+        run: ./.github/e2e/traefik/run-smoke-test.sh
+        env:
+          OPENAPPSEC_TRAEFIK_IMAGE: openappsec-traefik:test
+
+      - name: E2E test (with open-appsec agent, prevent mode)
+        run: ./.github/e2e/traefik/run-e2e-test.sh
+        env:
+          OPENAPPSEC_TRAEFIK_IMAGE: openappsec-traefik:test

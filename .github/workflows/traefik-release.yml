@@ -1,0 +1,88 @@
+name: traefik-release
+
+# Manually build and publish the openappsec-traefik image for a given traefik
+# version to ghcr.io/<owner>/openappsec-traefik.
+on:
+  workflow_dispatch:
+    inputs:
+      traefik_version:
+        description: "Traefik version to build against (e.g. v3.7.10)"
+        required: true
+        default: "v3.7.10"
+      extra_tag:
+        description: "Additional image tag (optional, e.g. latest)"
+        required: false
+        default: ""
+      platforms:
+        description: "Target platforms"
+        required: false
+        default: "linux/amd64"
+      run_e2e:
+        description: "Run the e2e test before pushing"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release:
+    name: Build & push openappsec-traefik ${{ inputs.traefik_version }}
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/openappsec-traefik
+      TRAEFIK_BASE: docker.io/library/traefik:${{ inputs.traefik_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        if: ${{ inputs.platforms != 'linux/amd64' }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image for testing (native arch)
+        run: |
+          docker build -f docker/openappsec-traefik/Dockerfile \
+            --build-arg "TRAEFIK_BASE=${TRAEFIK_BASE}" \
+            -t openappsec-traefik:test .
+
+      - name: Smoke test (no agent, fail-open)
+        if: ${{ inputs.run_e2e }}
+        run: ./.github/e2e/traefik/run-smoke-test.sh
+        env:
+          OPENAPPSEC_TRAEFIK_IMAGE: openappsec-traefik:test
+
+      - name: E2E test (with open-appsec agent, prevent mode)
+        if: ${{ inputs.run_e2e }}
+        run: ./.github/e2e/traefik/run-e2e-test.sh
+        env:
+          OPENAPPSEC_TRAEFIK_IMAGE: openappsec-traefik:test
+
+      - name: Compute tags
+        id: tags
+        run: |
+          tags="${IMAGE}:${{ inputs.traefik_version }}"
+          if [ -n "${{ inputs.extra_tag }}" ]; then
+            tags="${tags},${IMAGE}:${{ inputs.extra_tag }}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/openappsec-traefik/Dockerfile
+          platforms: ${{ inputs.platforms }}
+          build-args: |
+            TRAEFIK_BASE=${{ env.TRAEFIK_BASE }}
+          tags: ${{ steps.tags.outputs.tags }}
+          push: true

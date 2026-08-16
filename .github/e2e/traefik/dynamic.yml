@@ -1,0 +1,21 @@
+http:
+  routers:
+    whoami:
+      rule: PathPrefix(`/`)
+      entryPoints:
+        - web
+      middlewares:
+        - appsec
+      service: whoami
+
+  middlewares:
+    appsec:
+      plugin:
+        openappsec:
+          daemonAddr: http://127.0.0.1:8579
+
+  services:
+    whoami:
+      loadBalancer:
+        servers:
+          - url: http://whoami:80

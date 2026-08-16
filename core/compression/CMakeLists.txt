@@ -4,6 +4,7 @@ add_library(osrc_compression_utils SHARED compression_utils.cc)
 
 target_link_libraries(osrc_compression_utils
     ${Brotli_LIBRARIES}
+    z
 )
 
 install(TARGETS osrc_compression_utils DESTINATION lib)
