@@ -278,28 +278,29 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}()
 
-	if start.ContainsBody {
-		reply, err = m.inspectRequestBody(sid, req)
-		if err != nil {
-			m.noteFailure(err)
-			if m.failClose {
-				writeBlock(rw, nil)
-				return
-			}
-			// Fail-open: forward without further inspection.
-			m.next.ServeHTTP(rw, req)
+	// Inspect the request body (if any) and always end the request phase so
+	// the agent state machine advances before response inspection, mirroring
+	// the envoy/kong attachments.
+	reply, err = m.inspectRequestBody(sid, req)
+	if err != nil {
+		m.noteFailure(err)
+		if m.failClose {
+			writeBlock(rw, nil)
 			return
 		}
-		switch reply.Verdict {
-		case verdictDrop:
-			sessionActive = false
-			writeBlock(rw, reply.Response)
-			return
-		case verdictAccept, verdictNoop:
-			sessionActive = false
-			m.next.ServeHTTP(rw, req)
-			return
-		}
+		// Fail-open: forward without further inspection.
+		m.next.ServeHTTP(rw, req)
+		return
+	}
+	switch reply.Verdict {
+	case verdictDrop:
+		sessionActive = false
+		writeBlock(rw, reply.Response)
+		return
+	case verdictAccept, verdictNoop:
+		sessionActive = false
+		m.next.ServeHTTP(rw, req)
+		return
 	}
 
 	if !m.responseInspection {

@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 BASE_URL=${BASE_URL:-http://127.0.0.1:8080}
-ATTACK_URL="$BASE_URL/?arg=%27%20OR%201%3D1%20UNION%20SELECT%20username%2C%20password%20FROM%20users--"
+ATTACK_URL="$BASE_URL/?file=../../../../etc/passwd"
 TIMEOUT_SEC=${TIMEOUT_SEC:-420}
 
 compose() {

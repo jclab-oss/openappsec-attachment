@@ -177,7 +177,7 @@ func TestGetRequestSkipsBodyInspection(t *testing.T) {
 		t.Fatalf("expected 200, got %d", recorder.Code)
 	}
 	calls := env.daemon.callNames()
-	expected := []string{"start", "response-headers", "response-body", "response-end"}
+	expected := []string{"start", "request-end", "response-headers", "response-body", "response-end"}
 	if strings.Join(calls, ",") != strings.Join(expected, ",") {
 		t.Fatalf("unexpected call sequence: %v", calls)
 	}
