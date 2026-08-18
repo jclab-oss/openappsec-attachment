@@ -66,7 +66,19 @@ jobs:
         env:
           OPENAPPSEC_TRAEFIK_IMAGE: openappsec-traefik:test
 
-      - name: Benchmark (with vs without the attachment)
+      - name: Build image with the middleware compiled in
+        run: |
+          docker build -f docker/openappsec-traefik/Dockerfile.native \
+            --build-arg OPENAPPSEC_TRAEFIK_IMAGE=openappsec-traefik:test \
+            -t openappsec-traefik-native:test .
+
+      - name: E2E test (built-in middleware)
+        run: ./.github/e2e/traefik/run-e2e-test.sh
+        env:
+          OPENAPPSEC_TRAEFIK_IMAGE: openappsec-traefik-native:test
+
+      - name: Benchmark (no attachment vs Yaegi plugin vs built-in middleware)
         run: ./.github/e2e/traefik/run-benchmark.sh
         env:
           OPENAPPSEC_TRAEFIK_IMAGE: openappsec-traefik:test
+          OPENAPPSEC_TRAEFIK_NATIVE_IMAGE: openappsec-traefik-native:test

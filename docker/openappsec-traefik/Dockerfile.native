@@ -1,0 +1,47 @@
+# open-appsec attachment for traefik, compiled into the traefik binary.
+#
+# Same attachment as the default image, but the middleware is built into
+# traefik instead of being interpreted by Yaegi. It is configured identically
+# (experimental.localPlugins + a plugin.openappsec middleware), so the two
+# images are drop-in alternatives and directly comparable.
+#
+# Build from the repository root, after building the base image:
+#   docker build -f docker/openappsec-traefik/Dockerfile.native \
+#       --build-arg OPENAPPSEC_TRAEFIK_IMAGE=openappsec-traefik \
+#       --build-arg TRAEFIK_VERSION=v3.7.10 .
+ARG OPENAPPSEC_TRAEFIK_IMAGE=openappsec-traefik
+ARG GO_IMAGE=golang:1.26-alpine
+
+FROM ${GO_IMAGE} AS traefik-builder
+
+ARG TRAEFIK_VERSION=v3.7.10
+
+RUN apk add --no-cache git python3
+
+# The web UI assets ship as a placeholder in the repository, which satisfies the
+# //go:embed in webui; the dashboard is not needed by the attachment.
+RUN git clone --depth 1 --branch "${TRAEFIK_VERSION}" https://github.com/traefik/traefik.git /traefik
+
+COPY attachments/traefik/plugin /plugin
+COPY attachments/traefik/native /native
+
+RUN python3 /native/patch_traefik.py /traefik /plugin
+# -buildvcs=false: the tree is a shallow clone owned by another user inside the
+# build container, which makes the VCS stamping step fail.
+RUN cd /traefik && go build -buildvcs=false -ldflags "-s -w" -o /out/traefik ./cmd/traefik
+
+FROM ${OPENAPPSEC_TRAEFIK_IMAGE}
+
+USER root
+
+# Replacing the binary keeps the daemon, the nano attachment libraries and the
+# entrypoint of the base image untouched.
+COPY --from=traefik-builder /out/traefik /usr/local/bin/traefik
+
+# Traefik validates every declared local plugin against its manifest before the
+# builder runs, so the manifest has to stay. The Go sources do not: dropping
+# them makes it impossible for this image to fall back to the interpreter, so
+# there is no ambiguity about which implementation served a request.
+RUN find /plugins-local -name '*.go' -delete
+
+ENV OPENAPPSEC_TRAEFIK_MIDDLEWARE=builtin

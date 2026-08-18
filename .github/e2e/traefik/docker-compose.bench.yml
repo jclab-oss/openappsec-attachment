@@ -1,5 +1,11 @@
-# Benchmark stack: the open-appsec agent, a whoami backend and traefik serving
-# it twice — with the attachment on :80 and without it on :81.
+# Benchmark stack: the open-appsec agent, a whoami backend and two traefik
+# variants that each serve the backend twice — with the attachment on :80 and
+# without it on :81.
+#
+# The two traefik variants are started one at a time, never together: an
+# attachment derives its shared-memory identity from its worker index, so two
+# attachments in one IPC namespace would collide. Running them sequentially
+# also keeps them from competing for CPU while the other is measured.
 services:
   appsec-agent:
     image: ghcr.io/openappsec/agent:latest
@@ -16,7 +22,8 @@ services:
       - ./appsec-localconfig:/ext/appsec
     command: /cp-nano-agent
 
-  traefik:
+  # Middleware interpreted by Yaegi (the default image).
+  traefik-yaegi:
     image: ${OPENAPPSEC_TRAEFIK_IMAGE:-openappsec-traefik:test}
     ipc: service:appsec-agent
     depends_on:
@@ -26,11 +33,27 @@ services:
       - "8081:81"
     volumes:
       - ./dynamic.bench.yml:/etc/traefik/dynamic.yml:ro
-    command:
+    # INFO so the benchmark can read back which middleware implementation was
+    # used; traefik does not log per request unless the access log is enabled,
+    # so this does not affect the measurement.
+    command: &traefik_command
       - --entrypoints.web.address=:80
       - --entrypoints.baseline.address=:81
       - --providers.file.filename=/etc/traefik/dynamic.yml
-      - --log.level=ERROR
+      - --log.level=INFO
+
+  # The same middleware compiled into the traefik binary.
+  traefik-native:
+    image: ${OPENAPPSEC_TRAEFIK_NATIVE_IMAGE:-openappsec-traefik-native:test}
+    ipc: service:appsec-agent
+    depends_on:
+      - appsec-agent
+    ports:
+      - "8080:80"
+      - "8081:81"
+    volumes:
+      - ./dynamic.bench.yml:/etc/traefik/dynamic.yml:ro
+    command: *traefik_command
 
   whoami:
     image: traefik/whoami:latest

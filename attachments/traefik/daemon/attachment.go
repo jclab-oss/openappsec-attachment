@@ -120,6 +120,31 @@ type AttachmentManager struct {
 	sessions      map[uint32]*session
 	nextSessionID atomic.Uint32
 	sessionTTL    time.Duration
+
+	stats Stats
+}
+
+// Stats counts the inspection work done, which is what makes two deployments
+// comparable: a transaction the agent finalizes on the first call costs one
+// round trip, while one it keeps inspecting costs a call per body chunk and
+// per response stage.
+type Stats struct {
+	// TransactionsStarted counts calls that opened a transaction.
+	TransactionsStarted atomic.Uint64
+	// TransactionsInspected counts transactions the agent did not finalize
+	// immediately, i.e. the ones that were inspected beyond their first call.
+	TransactionsInspected atomic.Uint64
+	// ChunksSent counts every chunk handed to the agent.
+	ChunksSent atomic.Uint64
+}
+
+// Snapshot returns the current counters.
+func (m *AttachmentManager) Snapshot() map[string]uint64 {
+	return map[string]uint64{
+		"transactionsStarted":   m.stats.TransactionsStarted.Load(),
+		"transactionsInspected": m.stats.TransactionsInspected.Load(),
+		"chunksSent":            m.stats.ChunksSent.Load(),
+	}
 }
 
 // NewAttachmentManager creates a manager with numWorkers attachment instances.
@@ -280,11 +305,14 @@ func (m *AttachmentManager) StartTransaction(data *StartTransactionData) (uint32
 	m.sessions[sid] = s
 	m.sessionsMu.Unlock()
 
+	m.stats.TransactionsStarted.Add(1)
+
 	res := m.sendStartTransaction(s, data)
 	if res.Verdict != VerdictInspect {
 		m.FiniSession(sid)
 		return 0, res
 	}
+	m.stats.TransactionsInspected.Add(1)
 	return sid, res
 }
 
@@ -507,6 +535,8 @@ func (m *AttachmentManager) sendChunkWithBody(
 	body []byte,
 	numChunks int,
 ) *InspectionResult {
+	m.stats.ChunksSent.Add(1)
+
 	attachmentData := (*C.AttachmentData)(C.calloc(1, C.sizeof_AttachmentData))
 	attachmentData.session_id = C.SessionID(s.id)
 	attachmentData.chunk_type = chunkType

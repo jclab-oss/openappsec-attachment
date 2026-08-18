@@ -72,11 +72,20 @@ jobs:
         env:
           OPENAPPSEC_TRAEFIK_IMAGE: openappsec-traefik:test
 
-      - name: Benchmark (with vs without the attachment)
+      - name: Build image with the middleware compiled in
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          docker build -f docker/openappsec-traefik/Dockerfile.native \
+            --build-arg OPENAPPSEC_TRAEFIK_IMAGE=openappsec-traefik:test \
+            --build-arg "TRAEFIK_VERSION=${{ inputs.traefik_version }}" \
+            -t openappsec-traefik-native:test .
+
+      - name: Benchmark (no attachment vs Yaegi plugin vs built-in middleware)
         if: ${{ inputs.run_benchmark }}
         run: ./.github/e2e/traefik/run-benchmark.sh
         env:
           OPENAPPSEC_TRAEFIK_IMAGE: openappsec-traefik:test
+          OPENAPPSEC_TRAEFIK_NATIVE_IMAGE: openappsec-traefik-native:test
 
       - name: Compute tags
         id: tags

@@ -88,7 +88,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]bool{"ready": s.manager.Ready()})
+	body := map[string]any{"ready": s.manager.Ready()}
+	for name, value := range s.manager.Snapshot() {
+		body[name] = value
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) handleLoadConfig(w http.ResponseWriter, r *http.Request) {
