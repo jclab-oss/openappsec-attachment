@@ -52,6 +52,7 @@ def load(result_dir, name):
         "p99": latency["p99"],
         "chunks": read_int(result_dir, name, "chunks"),
         "failures": read_int(result_dir, name, "failures"),
+        "rejected": read_int(result_dir, name, "rejected"),
         "inspecting_after": read_text(result_dir, name, "inspecting"),
     }
 
@@ -243,6 +244,17 @@ def main():
                     "sheds inspection under this load — so its numbers are the cost of "
                     "passing traffic through, not of inspecting it.".format(title, label)
                 )
+            # Past its inspection capacity the daemon queues transactions and
+            # eventually lets them through uninspected. That is a statement
+            # about the load, not about the implementation.
+            if data["rejected"]:
+                notes.append(
+                    "{}: {} offered more concurrent transactions than the daemon has "
+                    "attachments; {:,} waited out the queue and went uninspected. Raise "
+                    "the worker count or lower the load to measure inspection at this "
+                    "rate.".format(title, label, data["rejected"])
+                )
+
             if data["failures"]:
                 warnings.append(
                     "{}: {} hit {} daemon failures during the run; each one opens the "

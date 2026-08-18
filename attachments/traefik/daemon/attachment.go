@@ -102,10 +102,13 @@ type worker struct {
 }
 
 type session struct {
-	id         uint32
-	worker     *worker
-	data       *C.HttpSessionData
-	mu         sync.Mutex
+	id     uint32
+	worker *worker
+	data   *C.HttpSessionData
+	mu     sync.Mutex
+	// released returns the attachment to the idle pool exactly once, no matter
+	// which of the several paths finalizes the session.
+	released   sync.Once
 	lastActive atomic.Int64
 }
 
@@ -114,12 +117,28 @@ func (s *session) touch() {
 }
 
 // AttachmentManager owns the nano attachment instances and the active sessions.
+//
+// A transaction holds an attachment for its whole lifetime, the way an nginx
+// worker process does. The attachment library runs each IPC call in a thread it
+// cancels on timeout, and a cancelled thread can leave the shared-memory ring
+// queue half-written; interleaving a second transaction onto the same
+// attachment then writes over that damage, which the agent reports as a
+// corrupted queue before the attachment gives up. Handing an attachment to one
+// transaction at a time keeps that damage confined to the transaction that
+// caused it.
+//
+// The cost is a ceiling: no more transactions can be inspected at once than
+// there are attachments. Beyond it requests queue for one, and the daemon says
+// so rather than quietly inspecting nothing.
 type AttachmentManager struct {
-	workers       []*worker
-	sessionsMu    sync.RWMutex
-	sessions      map[uint32]*session
-	nextSessionID atomic.Uint32
-	sessionTTL    time.Duration
+	workers []*worker
+	// idle carries the attachments no transaction is currently holding.
+	idle           chan *worker
+	acquireTimeout time.Duration
+	sessionsMu     sync.RWMutex
+	sessions       map[uint32]*session
+	nextSessionID  atomic.Uint32
+	sessionTTL     time.Duration
 
 	stats Stats
 }
@@ -136,6 +155,11 @@ type Stats struct {
 	TransactionsInspected atomic.Uint64
 	// ChunksSent counts every chunk handed to the agent.
 	ChunksSent atomic.Uint64
+	// TransactionsQueued counts transactions that had to wait for a free
+	// attachment, and TransactionsRejected the ones that gave up waiting.
+	// Together they say how far past its inspection capacity the traffic is.
+	TransactionsQueued   atomic.Uint64
+	TransactionsRejected atomic.Uint64
 }
 
 // Snapshot returns the current counters.
@@ -143,23 +167,59 @@ func (m *AttachmentManager) Snapshot() map[string]uint64 {
 	return map[string]uint64{
 		"transactionsStarted":   m.stats.TransactionsStarted.Load(),
 		"transactionsInspected": m.stats.TransactionsInspected.Load(),
+		"transactionsQueued":    m.stats.TransactionsQueued.Load(),
+		"transactionsRejected":  m.stats.TransactionsRejected.Load(),
 		"chunksSent":            m.stats.ChunksSent.Load(),
+		"attachmentsIdle":       uint64(len(m.idle)),
 	}
 }
 
 // NewAttachmentManager creates a manager with numWorkers attachment instances.
-// The attachments are initialized in the background; until an attachment is
-// ready its sessions get a "noop" verdict (fail-open).
-func NewAttachmentManager(numWorkers int, sessionTTL time.Duration) *AttachmentManager {
+// The attachments are initialized in the background and join the idle pool as
+// they register; until one is available a transaction waits up to
+// acquireTimeout for it.
+func NewAttachmentManager(numWorkers int, sessionTTL, acquireTimeout time.Duration) *AttachmentManager {
 	m := &AttachmentManager{
-		workers:    make([]*worker, numWorkers),
-		sessions:   make(map[uint32]*session),
-		sessionTTL: sessionTTL,
+		workers:        make([]*worker, numWorkers),
+		idle:           make(chan *worker, numWorkers),
+		acquireTimeout: acquireTimeout,
+		sessions:       make(map[uint32]*session),
+		sessionTTL:     sessionTTL,
 	}
 	for i := range m.workers {
 		m.workers[i] = &worker{}
 	}
 	return m
+}
+
+// acquire takes an attachment out of the idle pool for the caller's exclusive
+// use, or reports that none came free in time.
+func (m *AttachmentManager) acquire() (*worker, bool) {
+	select {
+	case w := <-m.idle:
+		return w, true
+	default:
+	}
+
+	// Every attachment is busy, so this transaction is queued behind one.
+	m.stats.TransactionsQueued.Add(1)
+	timer := time.NewTimer(m.acquireTimeout)
+	defer timer.Stop()
+	select {
+	case w := <-m.idle:
+		return w, true
+	case <-timer.C:
+		m.stats.TransactionsRejected.Add(1)
+		return nil, false
+	}
+}
+
+// release returns the session's attachment to the idle pool. Safe to call from
+// each of the paths that can finalize a session; only the first one counts.
+func (m *AttachmentManager) release(s *session) {
+	s.released.Do(func() {
+		m.idle <- s.worker
+	})
 }
 
 // Init keeps retrying the registration of every attachment instance with the
@@ -179,6 +239,7 @@ func (m *AttachmentManager) Init() {
 				w.attachment = attachment
 				w.mu.Unlock()
 				w.ready.Store(true)
+				m.idle <- w
 				log.Printf("nano attachment worker %d/%d registered", i+1, numWorkers)
 				break
 			}
@@ -269,26 +330,29 @@ func (m *AttachmentManager) FiniSession(id uint32) {
 	}
 	m.removeSession(id)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.data != nil {
 		s.worker.mu.Lock()
 		C.FiniSessionData(s.worker.attachment, s.data)
 		s.worker.mu.Unlock()
 		s.data = nil
 	}
+	s.mu.Unlock()
+	m.release(s)
 }
 
 // StartTransaction creates a new session and sends the request metadata and
 // headers for inspection. On a final verdict the session is finalized before
 // returning.
 func (m *AttachmentManager) StartTransaction(data *StartTransactionData) (uint32, *InspectionResult) {
-	// Round-robin worker selection.
 	sid := m.nextSessionID.Add(1)
 	if sid == 0 { // CORRUPTED_SESSION_ID
 		sid = m.nextSessionID.Add(1)
 	}
-	w := m.workers[int(sid)%len(m.workers)]
-	if !w.ready.Load() {
+
+	// One transaction per attachment, held until the session is finalized.
+	w, ok := m.acquire()
+	if !ok {
+		log.Printf("no attachment free within %s; transaction not inspected", m.acquireTimeout)
 		return 0, &InspectionResult{Verdict: VerdictNoop}
 	}
 
@@ -296,6 +360,7 @@ func (m *AttachmentManager) StartTransaction(data *StartTransactionData) (uint32
 	sessionData := C.InitSessionData(w.attachment, C.SessionID(sid))
 	w.mu.Unlock()
 	if sessionData == nil {
+		m.idle <- w
 		return 0, &InspectionResult{Verdict: VerdictNoop}
 	}
 
@@ -517,6 +582,7 @@ func (m *AttachmentManager) finalizeLocked(s *session) {
 		s.worker.mu.Unlock()
 		s.data = nil
 	}
+	m.release(s)
 }
 
 func (m *AttachmentManager) sendChunk(

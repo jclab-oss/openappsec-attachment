@@ -176,7 +176,9 @@ assert_implementation() {
 # uninspected baseline, so a slower traefik build cannot masquerade as
 # inspection overhead.
 measure_variant() {
-    local variant=$1 service=$2
+    local variant=$1 service=$2 scenario method body path
+    local failures_before failures_after chunks_before chunks_after
+    local rejected_before rejected_after
 
     echo "=== $variant ==="
     # A fresh agent per variant. An attachment's shared-memory identity is its
@@ -191,7 +193,6 @@ measure_variant() {
     assert_implementation "$variant" "$service"
     echo "Attachment is inspecting."
 
-    local scenario method body path
     for scenario in get post; do
         case "$scenario" in
             get)  method=GET;  body="";           path="/" ;;
@@ -201,12 +202,20 @@ measure_variant() {
         run_case "${scenario}-baseline-${variant}" "$BASELINE_URL$path" "$method" "$body"
 
         echo "  - $scenario $variant"
-        local failures_before failures_after chunks_before chunks_after
         failures_before=$(daemon_failures "$service")
         chunks_before=$(daemon_stat "$service" chunksSent)
+        rejected_before=$(daemon_stat "$service" transactionsRejected)
         run_case "${scenario}-${variant}" "$APPSEC_URL$path" "$method" "$body"
         chunks_after=$(daemon_stat "$service" chunksSent)
+        rejected_after=$(daemon_stat "$service" transactionsRejected)
         failures_after=$(daemon_failures "$service")
+
+        # Transactions that waited out the queue and went uninspected: the
+        # daemon is at capacity, which is a fact about the load, not the run.
+        if [ -n "$rejected_before" ] && [ -n "$rejected_after" ] &&
+            [ "$rejected_after" -gt "$rejected_before" ]; then
+            echo "$(( rejected_after - rejected_before ))" > "$RESULT_DIR/${scenario}-${variant}.rejected"
+        fi
         record_inspection_state "${scenario}-${variant}"
 
         if [ -n "$chunks_before" ] && [ -n "$chunks_after" ]; then

@@ -29,6 +29,15 @@ pieces that run inside the same container:
   `nano_attachment` C library (the same library used by the kong and envoy
   attachments). It registers with the open-appsec agent over shared memory
   IPC and exposes a local HTTP API for the plugin.
+
+  A transaction holds one attachment for its whole lifetime, the way an nginx
+  worker process does, so the number of attachments is also the number of
+  transactions that can be inspected at once; past that, requests wait for one.
+  This is not tuning. The library runs each IPC call in a thread it cancels on
+  timeout, and a cancelled thread can leave the shared-memory ring queue
+  half-written — interleaving a second transaction onto the same attachment
+  writes over that damage, which the agent reports as a corrupted queue shortly
+  before the attachment dies and takes inspection with it.
 - **native/** – the same plugin package compiled into traefik instead of
   interpreted. Traefik has no supported way to build a middleware in, so
   `patch_traefik.py` adds one: it registers a compiled-in builder keyed by
@@ -58,9 +67,10 @@ The daemon is configured through environment variables:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `OPENAPPSEC_DAEMON_LISTEN` | `127.0.0.1:8579` | Listen address (`host:port` or `unix:///path`). |
-| `OPENAPPSEC_SESSION_TTL_SEC` | `120` | Idle session garbage-collection timeout. |
+| `OPENAPPSEC_SESSION_TTL_SEC` | `60` | Idle session garbage-collection timeout. A stuck session holds an attachment, so this bounds how long it can. |
+| `OPENAPPSEC_ACQUIRE_TIMEOUT_MS` | `5000` | How long a transaction waits for a free attachment before giving up and going uninspected. |
 | `CONCURRENCY_CALC` | `numOfCores` | `numOfCores`, `istioCpuLimit` or `custom`. |
-| `CONCURRENCY_NUMBER` | – | Number of attachment workers when `CONCURRENCY_CALC=custom`. |
+| `CONCURRENCY_NUMBER` | – | Number of attachment workers when `CONCURRENCY_CALC=custom`. This is the inspection concurrency limit. |
 | `OPENAPPSEC_DAEMON_DISABLED` | `false` | (entrypoint) do not start the daemon. |
 
 ## Verdict semantics
