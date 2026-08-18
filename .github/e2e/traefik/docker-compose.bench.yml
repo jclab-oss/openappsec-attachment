@@ -31,6 +31,11 @@ services:
     ports:
       - "8080:80"
       - "8081:81"
+    environment:
+      # A transaction holds one attachment, so this is the inspection
+      # concurrency limit. Left unset it follows the CPU count.
+      - CONCURRENCY_CALC=${BENCH_CONCURRENCY_CALC:-numOfCores}
+      - CONCURRENCY_NUMBER=${BENCH_ATTACHMENT_WORKERS:-}
     volumes:
       - ./dynamic.bench.yml:/etc/traefik/dynamic.yml:ro
     # INFO so the benchmark can read back which middleware implementation was
@@ -51,6 +56,11 @@ services:
     ports:
       - "8080:80"
       - "8081:81"
+    environment:
+      # A transaction holds one attachment, so this is the inspection
+      # concurrency limit. Left unset it follows the CPU count.
+      - CONCURRENCY_CALC=${BENCH_CONCURRENCY_CALC:-numOfCores}
+      - CONCURRENCY_NUMBER=${BENCH_ATTACHMENT_WORKERS:-}
     volumes:
       - ./dynamic.bench.yml:/etc/traefik/dynamic.yml:ro
     command: *traefik_command

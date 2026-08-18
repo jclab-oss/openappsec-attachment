@@ -38,6 +38,30 @@ pieces that run inside the same container:
   half-written — interleaving a second transaction onto the same attachment
   writes over that damage, which the agent reports as a corrupted queue shortly
   before the attachment dies and takes inspection with it.
+
+  Exclusivity contains that damage but does not prevent it: a call that outruns
+  the agent's thread timeout still corrupts its own attachment's queue, the
+  library restarts that channel, and the requests in flight on it are lost —
+  served as block pages even though the agent logged no security decision.
+
+  So more attachments is not more capacity, and fewer is not more safety. Both
+  directions lose requests, for opposite reasons — past the agent's capacity
+  the queues corrupt, below it transactions pile up waiting for an attachment.
+  Measured on a 20-core host at concurrency 20, 20 s of GET traffic:
+
+  | attachments | throughput | reached the backend | corrupted queues |
+  | ---: | ---: | ---: | ---: |
+  | 4  | 1093 req/s | 84.5% | 0 |
+  | 8  | 1335 req/s | 93.2% | 0 |
+  | 20 | 1409 req/s | 98.6% | 24 |
+  | 60 | 4077 req/s | 0.4% | 102 |
+
+  The 60-attachment row is the shape to recognise: throughput climbs while the
+  traffic that actually reached the backend collapses, because serving a block
+  page is cheaper than inspecting. One attachment per core — the default — was
+  the best of these; treat the setting as how much inspection the agent is
+  asked to do at once, and check the share of traffic reaching the backend
+  after changing it in either direction.
 - **native/** – the same plugin package compiled into traefik instead of
   interpreted. Traefik has no supported way to build a middleware in, so
   `patch_traefik.py` adds one: it registers a compiled-in builder keyed by
