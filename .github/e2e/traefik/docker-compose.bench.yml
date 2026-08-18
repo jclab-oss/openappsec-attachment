@@ -1,0 +1,41 @@
+# Benchmark stack: the open-appsec agent, a whoami backend and traefik serving
+# it twice — with the attachment on :80 and without it on :81.
+services:
+  appsec-agent:
+    image: ghcr.io/openappsec/agent:latest
+    container_name: appsec-agent
+    ipc: shareable
+    environment:
+      - user_email=e2e-test@openappsec.io
+      - registered_server=Traefik Server
+      - autoPolicyLoad=true
+    volumes:
+      - appsec-config:/etc/cp/conf
+      - appsec-data:/etc/cp/data
+      - appsec-logs:/var/log/nano_agent
+      - ./appsec-localconfig:/ext/appsec
+    command: /cp-nano-agent
+
+  traefik:
+    image: ${OPENAPPSEC_TRAEFIK_IMAGE:-openappsec-traefik:test}
+    ipc: service:appsec-agent
+    depends_on:
+      - appsec-agent
+    ports:
+      - "8080:80"
+      - "8081:81"
+    volumes:
+      - ./dynamic.bench.yml:/etc/traefik/dynamic.yml:ro
+    command:
+      - --entrypoints.web.address=:80
+      - --entrypoints.baseline.address=:81
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --log.level=ERROR
+
+  whoami:
+    image: traefik/whoami:latest
+
+volumes:
+  appsec-config:
+  appsec-data:
+  appsec-logs:

@@ -64,4 +64,20 @@ block instead. Final verdicts (`accept`/`drop`) finalize the session early;
 `drop` renders the block page / redirect / custom response provided by the
 agent.
 
+## Benchmark
+
+`.github/e2e/traefik/run-benchmark.sh` measures the cost of inspection: one
+traefik instance serves the same backend on two entrypoints, with the
+middleware on `:80` and without it on `:81`, so the delta between the two is
+the attachment overhead. The script refuses to measure until it has confirmed
+the agent is actively inspecting (an attack request returns 403), because a
+failing-open attachment would only measure the daemon round-trip.
+
+```bash
+OPENAPPSEC_TRAEFIK_IMAGE=openappsec-traefik:test ./.github/e2e/traefik/run-benchmark.sh
+```
+
+`BENCH_REQUESTS` (default 2000) and `BENCH_CONCURRENCY` (default 20) tune the
+load. The CI workflows run it and publish the table to the job summary.
+
 See `docker/openappsec-traefik/` for the container image build.

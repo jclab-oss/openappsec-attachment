@@ -65,3 +65,8 @@ jobs:
         run: ./.github/e2e/traefik/run-e2e-test.sh
         env:
           OPENAPPSEC_TRAEFIK_IMAGE: openappsec-traefik:test
+
+      - name: Benchmark (with vs without the attachment)
+        run: ./.github/e2e/traefik/run-benchmark.sh
+        env:
+          OPENAPPSEC_TRAEFIK_IMAGE: openappsec-traefik:test

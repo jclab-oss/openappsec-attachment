@@ -1,0 +1,32 @@
+# Benchmark configuration: the same traefik instance serves the same backend
+# on two entrypoints, one with the open-appsec middleware and one without, so
+# the two measurements differ only by the attachment.
+http:
+  routers:
+    # "after": traffic inspected by the open-appsec attachment.
+    whoami-appsec:
+      rule: PathPrefix(`/`)
+      entryPoints:
+        - web
+      middlewares:
+        - appsec
+      service: whoami
+
+    # "before": identical route without the middleware.
+    whoami-baseline:
+      rule: PathPrefix(`/`)
+      entryPoints:
+        - baseline
+      service: whoami
+
+  middlewares:
+    appsec:
+      plugin:
+        openappsec:
+          daemonAddr: http://127.0.0.1:8579
+
+  services:
+    whoami:
+      loadBalancer:
+        servers:
+          - url: http://whoami:80
