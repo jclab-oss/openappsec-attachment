@@ -11,10 +11,27 @@ cd "$(dirname "$0")"
 APPSEC_URL=${APPSEC_URL:-http://127.0.0.1:8080}
 BASELINE_URL=${BASELINE_URL:-http://127.0.0.1:8081}
 REQUESTS=${BENCH_REQUESTS:-2000}
-CONCURRENCY=${BENCH_CONCURRENCY:-20}
 WARMUP_REQUESTS=${BENCH_WARMUP_REQUESTS:-200}
 OHA_IMAGE=${OHA_IMAGE:-ghcr.io/hatoo/oha:latest}
 READY_TIMEOUT_SEC=${READY_TIMEOUT_SEC:-420}
+
+# Concurrency is derived from the CPU count so the benchmark measures the
+# per-request cost of inspection instead of the queueing delay of an overloaded
+# agent. The load generator, traefik, the agent and the backend all share these
+# CPUs, and inspection is the expensive part, so a fraction of the cores keeps
+# the agent below saturation: a quarter of the cores measured cleanly on a
+# 20-core host where driving it at one connection per core pushed p99 from
+# 16 ms to 3 s. Set BENCH_CONCURRENCY to pin it instead.
+CPUS=$(nproc)
+CONCURRENCY_DIVISOR=${BENCH_CONCURRENCY_DIVISOR:-4}
+CONCURRENCY=${BENCH_CONCURRENCY:-}
+if [ -z "$CONCURRENCY" ]; then
+    CONCURRENCY=$(( CPUS / CONCURRENCY_DIVISOR ))
+    if [ "$CONCURRENCY" -lt 2 ]; then
+        CONCURRENCY=2
+    fi
+fi
+
 RESULT_DIR=$(mktemp -d)
 
 compose() {
@@ -66,29 +83,34 @@ if [ "$inspecting" != "1" ]; then
 fi
 echo "Attachment is inspecting."
 
+POST_BODY="name=john&city=seoul&comment=hello+from+the+benchmark"
+
+# oha <requests> <concurrency> <url> <method> [body] -- writes JSON to stdout
+oha() {
+    local requests=$1 concurrency=$2 url=$3 method=$4 body=${5:-}
+    local args=(--no-tui -c "$concurrency" -m "$method" --disable-keepalive)
+    if [ -n "$body" ]; then
+        args+=(-d "$body" -H "Content-Type: application/x-www-form-urlencoded")
+    fi
+    docker run --rm --network host "$OHA_IMAGE" \
+        --output-format json -n "$requests" "${args[@]}" "$url"
+}
+
 # run_case <output-name> <url> <method> [body]
 run_case() {
     local name=$1 url=$2 method=$3 body=${4:-}
-    local common=(--no-tui -c "$CONCURRENCY" -m "$method" --disable-keepalive)
-    if [ -n "$body" ]; then
-        common+=(-d "$body" -H "Content-Type: application/x-www-form-urlencoded")
-    fi
-
     # Warm up so plugin/daemon start-up costs do not skew the measurement.
-    docker run --rm --network host "$OHA_IMAGE" \
-        --output-format quiet -n "$WARMUP_REQUESTS" "${common[@]}" "$url" >/dev/null 2>&1 || true
-
-    docker run --rm --network host "$OHA_IMAGE" \
-        --output-format json -n "$REQUESTS" "${common[@]}" "$url" > "$RESULT_DIR/$name.json"
+    oha "$WARMUP_REQUESTS" "$CONCURRENCY" "$url" "$method" "$body" >/dev/null 2>&1 || true
+    oha "$REQUESTS" "$CONCURRENCY" "$url" "$method" "$body" > "$RESULT_DIR/$name.json"
 }
 
-echo "Running benchmark: ${REQUESTS} requests, concurrency ${CONCURRENCY}"
+echo "Running benchmark: ${REQUESTS} requests, concurrency ${CONCURRENCY} (${CPUS} CPUs)"
 for scenario in get post; do
     case "$scenario" in
         get)
             method=GET; body=""; path="/" ;;
         post)
-            method=POST; body="name=john&city=seoul&comment=hello+from+the+benchmark"; path="/form" ;;
+            method=POST; body="$POST_BODY"; path="/form" ;;
     esac
     echo "  - $scenario baseline"
     run_case "${scenario}-baseline" "$BASELINE_URL$path" "$method" "$body"
@@ -102,7 +124,7 @@ echo "Building the report..."
 workers=$(compose logs traefik 2>&1 |
     grep -o 'starting with [0-9]* attachment workers' | head -1 |
     grep -o '[0-9]*' || true)
-export BENCH_CPUS="$(nproc)"
+export BENCH_CPUS="$CPUS"
 export BENCH_WORKERS="${workers:-unknown}"
 report=$(python3 report_benchmark.py "$RESULT_DIR" "$REQUESTS" "$CONCURRENCY")
 echo "$report"

@@ -77,7 +77,12 @@ failing-open attachment would only measure the daemon round-trip.
 OPENAPPSEC_TRAEFIK_IMAGE=openappsec-traefik:test ./.github/e2e/traefik/run-benchmark.sh
 ```
 
-`BENCH_REQUESTS` (default 2000) and `BENCH_CONCURRENCY` (default 20) tune the
-load. The CI workflows run it and publish the table to the job summary.
+Concurrency is derived from the CPU count (`nproc / 4`, at least 2) so the
+benchmark stays below the point where the agent saturates and the numbers stop
+describing per-request cost: on a 20-core host, driving one connection per core
+pushed POST p99 from 16 ms to 3 s while p50 stayed at 11 ms. `BENCH_REQUESTS`
+(default 2000), `BENCH_CONCURRENCY_DIVISOR` (default 4) and `BENCH_CONCURRENCY`
+(pins concurrency outright) tune the load. The CI workflows run it and publish
+the table to the job summary.
 
 See `docker/openappsec-traefik/` for the container image build.
