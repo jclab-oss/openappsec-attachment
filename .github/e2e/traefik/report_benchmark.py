@@ -163,7 +163,9 @@ def main():
         ]
         if len(inspected) == 2:
             low, high = sorted(value for _, value in inspected)
-            if low == 0 or high > low * 2:
+            # Both at zero is not a mismatch — neither inspected anything, which
+            # the "no longer inspecting" warning already covers.
+            if high > 0 and (low <= 0 or high > low * 2):
                 notes.append(
                     "{}: the agent asked the two variants for very different amounts of "
                     "inspection ({}), so their timings measure different work, not two "

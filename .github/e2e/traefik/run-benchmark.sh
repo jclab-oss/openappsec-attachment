@@ -122,10 +122,20 @@ daemon_failures() {
 # changes as the agent learns, and it dwarfs the difference between the two
 # execution modes — so the counts have to be reported next to the timings for
 # the comparison to mean anything.
+# Prints the counter, or nothing if it could not be read. A failed read must
+# not come back as a number: subtracting one from a reading taken earlier
+# produces a negative "count" that looks like data.
 daemon_stat() {
-    local service=$1 field=$2
-    compose exec -T "$service" wget -q -O- http://127.0.0.1:8579/healthz 2>/dev/null |
-        python3 -c "import json,sys; print(json.load(sys.stdin).get('$field', 0))" 2>/dev/null || echo 0
+    local service=$1 field=$2 attempt value
+    for attempt in 1 2 3; do
+        value=$(compose exec -T "$service" wget -q -O- http://127.0.0.1:8579/healthz 2>/dev/null |
+            python3 -c "import json,sys; print(json.load(sys.stdin)['$field'])" 2>/dev/null || true)
+        if [ -n "$value" ]; then
+            echo "$value"
+            return 0
+        fi
+        sleep 1
+    done
 }
 
 # The two variants are configured identically, so confirm from the logs that
@@ -189,7 +199,11 @@ measure_variant() {
         failures_after=$(daemon_failures "$service")
         record_inspection_state "${scenario}-${variant}"
 
-        echo "$(( chunks_after - chunks_before ))" > "$RESULT_DIR/${scenario}-${variant}.chunks"
+        if [ -n "$chunks_before" ] && [ -n "$chunks_after" ]; then
+            echo "$(( chunks_after - chunks_before ))" > "$RESULT_DIR/${scenario}-${variant}.chunks"
+        else
+            echo "    NOTE: could not read the daemon's inspection counters for this run"
+        fi
         echo "$(( failures_after - failures_before ))" > "$RESULT_DIR/${scenario}-${variant}.failures"
     done
 
