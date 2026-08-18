@@ -96,8 +96,19 @@ docker build -f docker/openappsec-traefik/Dockerfile.native \
 ./.github/e2e/traefik/run-benchmark.sh
 ```
 
-`BENCH_REQUESTS` (default 2000) and `BENCH_CONCURRENCY` (default 20) tune the
-load. The CI workflows run it and publish the table to the job summary.
+`BENCH_DURATION` (default `20s` per case) and `BENCH_CONCURRENCY` (default 20)
+tune the load. The CI workflows run it and publish the table to the job summary.
+
+The benchmark runs the middleware **fail-closed**. Failing open makes "could
+not inspect" the fastest path through the middleware, which is how an inspected
+run ends up looking faster than no middleware at all — a result that cannot be
+true. Fail-closed removes that path, and because it replaces it with a flood of
+cheap 403s the report also tracks how much traffic actually reached the
+backend: a column serving blocked responses is measuring the cost of rejecting
+traffic, not of inspecting it. Load is measured over a fixed duration rather
+than a fixed request count for the same reason — a couple of thousand requests
+is a fraction of a second at these rates, and the run-to-run noise at that
+length reached 15%.
 
 Read the "chunks inspected" row before the timings. How much inspection a
 request costs is the agent's decision, not the middleware's: a transaction the

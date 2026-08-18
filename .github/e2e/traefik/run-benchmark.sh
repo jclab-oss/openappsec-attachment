@@ -20,9 +20,13 @@ cd "$(dirname "$0")"
 
 APPSEC_URL=${APPSEC_URL:-http://127.0.0.1:8080}
 BASELINE_URL=${BASELINE_URL:-http://127.0.0.1:8081}
-REQUESTS=${BENCH_REQUESTS:-2000}
+# Measured over a fixed duration, not a fixed request count: at a few thousand
+# requests per second a couple of thousand requests is a third of a second, and
+# run-to-run noise at that length reached 15% — enough to make an inspected run
+# look faster than an uninspected one.
+DURATION=${BENCH_DURATION:-20s}
 CONCURRENCY=${BENCH_CONCURRENCY:-20}
-WARMUP_REQUESTS=${BENCH_WARMUP_REQUESTS:-200}
+WARMUP_DURATION=${BENCH_WARMUP_DURATION:-5s}
 OHA_IMAGE=${OHA_IMAGE:-ghcr.io/hatoo/oha:latest}
 READY_TIMEOUT_SEC=${READY_TIMEOUT_SEC:-420}
 POST_BODY="name=john&city=seoul&comment=hello+from+the+benchmark"
@@ -53,10 +57,10 @@ run_case() {
     # Warm up so start-up costs do not skew the measurement. Yaegi in
     # particular is slowest on the first calls through a handler.
     docker run --rm --network host "$OHA_IMAGE" \
-        --output-format quiet -n "$WARMUP_REQUESTS" "${args[@]}" "$url" >/dev/null 2>&1 || true
+        --output-format quiet -z "$WARMUP_DURATION" "${args[@]}" "$url" >/dev/null 2>&1 || true
 
     docker run --rm --network host "$OHA_IMAGE" \
-        --output-format json -n "$REQUESTS" "${args[@]}" "$url" > "$RESULT_DIR/$name.json"
+        --output-format json -z "$DURATION" "${args[@]}" "$url" > "$RESULT_DIR/$name.json"
 }
 
 wait_for_traefik() {
@@ -71,15 +75,20 @@ wait_for_traefik() {
     return 1
 }
 
+# Inspecting means the middleware tells the two apart. Checking only that an
+# attack is blocked would also pass when everything is blocked, which is what
+# fail-closed does when it cannot reach the daemon at all.
 is_inspecting() {
-    local code
-    code=$(curl -s -o /dev/null -w '%{http_code}' "$APPSEC_URL/?file=../../../../etc/passwd" || echo 000)
-    [ "$code" = "403" ]
+    local attack benign
+    attack=$(curl -s -o /dev/null -w '%{http_code}' "$APPSEC_URL/?file=../../../../etc/passwd" || echo 000)
+    benign=$(curl -s -o /dev/null -w '%{http_code}' "$APPSEC_URL/" || echo 000)
+    [ "$attack" = "403" ] && [ "$benign" = "200" ]
 }
 
-# The inspected numbers only mean something once the agent actually inspects;
-# until registration and policy load finish the middleware fails open, which
-# would measure nothing but the daemon round-trip.
+# The inspected numbers only mean something once the agent actually inspects.
+# Before registration and policy load finish, a fail-closed middleware blocks
+# everything and a fail-open one forwards everything; neither is a measurement
+# of inspection.
 wait_for_inspection() {
     local start
     start=$(date +%s)
@@ -122,6 +131,7 @@ daemon_failures() {
 # changes as the agent learns, and it dwarfs the difference between the two
 # execution modes — so the counts have to be reported next to the timings for
 # the comparison to mean anything.
+#
 # Prints the counter, or nothing if it could not be read. A failed read must
 # not come back as a number: subtracting one from a reading taken earlier
 # produces a negative "count" that looks like data.
@@ -214,14 +224,14 @@ measure_variant() {
         grep -o '[0-9]*' > "$RESULT_DIR/$variant.workers" || true
 }
 
-echo "Running benchmark: ${REQUESTS} requests, concurrency ${CONCURRENCY}"
+echo "Running benchmark: ${DURATION} per case, concurrency ${CONCURRENCY}"
 measure_variant yaegi traefik-yaegi
 measure_variant native traefik-native
 
 echo "Building the report..."
 export BENCH_CPUS="$(nproc)"
 export BENCH_WORKERS="$(cat "$RESULT_DIR/yaegi.workers" 2>/dev/null || echo unknown)"
-report=$(python3 report_benchmark.py "$RESULT_DIR" "$REQUESTS" "$CONCURRENCY")
+report=$(python3 report_benchmark.py "$RESULT_DIR" "$DURATION" "$CONCURRENCY")
 echo "$report"
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then

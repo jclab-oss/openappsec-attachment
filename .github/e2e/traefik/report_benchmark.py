@@ -34,9 +34,18 @@ def load(result_dir, name):
         data = json.load(handle)
     metrics = data["metrics"]
     latency = metrics["latency_ms"]
+    codes = data.get("statusCodeDistribution") or {}
+    served = sum(codes.values())
     return {
         "rps": metrics["requests_per_sec"],
         "success_rate": metrics["success_rate"],
+        "codes": codes,
+        # Fraction of responses that actually came from the backend. Blocked
+        # requests are cheap to serve, so a run that got 403'd throughout looks
+        # fast for the same reason an uninspected one does.
+        "ok_ratio": (sum(count for code, count in codes.items() if code.startswith("2")) / served)
+        if served
+        else None,
         "mean": latency["mean"],
         "p50": latency["p50"],
         "p95": latency["p95"],
@@ -93,7 +102,7 @@ def cell(value, unit, reference, is_reference):
 
 
 def main():
-    result_dir, requests, concurrency = sys.argv[1], sys.argv[2], sys.argv[3]
+    result_dir, duration, concurrency = sys.argv[1], sys.argv[2], sys.argv[3]
 
     lines = [
         "## traefik attachment benchmark",
@@ -102,12 +111,13 @@ def main():
         "the same middleware configuration: without the attachment, with the "
         "middleware interpreted by traefik's Yaegi plugin runtime, and with the "
         "same middleware compiled into traefik. Each variant was measured on its "
-        "own, and only after an attack request returned 403 — a middleware that "
-        "is failing open would measure nothing but the daemon round-trip.",
+        "own, and only after it had been seen to pass a benign request and block "
+        "an attack. The middleware runs fail-closed here: failing open would make "
+        "\"could not inspect\" the fastest path through it.",
         "",
-        "`{} requests, concurrency {}, keep-alive disabled` on `{} CPUs` with "
+        "`{} per case, concurrency {}, keep-alive disabled` on `{} CPUs` with "
         "`{} attachment workers`".format(
-            requests,
+            duration,
             concurrency,
             os.environ.get("BENCH_CPUS", "unknown"),
             os.environ.get("BENCH_WORKERS", "unknown"),
@@ -139,6 +149,14 @@ def main():
             "| Success rate | {} |".format(
                 " | ".join(
                     "{:.1%}".format(data["success_rate"]) if data else "n/a"
+                    for _, data in measurements
+                )
+            )
+        )
+        lines.append(
+            "| Served by the backend | {} |".format(
+                " | ".join(
+                    "{:.1%}".format(data["ok_ratio"]) if data and data["ok_ratio"] is not None else "n/a"
                     for _, data in measurements
                 )
             )
@@ -187,6 +205,36 @@ def main():
                 )
             if index == 0:
                 continue
+
+            # Inspecting cannot make traffic faster than not inspecting it, so
+            # a column that comes out ahead is measuring something else —
+            # inspection that was skipped, or noise from too short a run.
+            if data["rps"] and reference["rps"] and data["rps"] > reference["rps"]:
+                warnings.append(
+                    "{}: {} measured faster than serving the same traffic with no "
+                    "attachment ({} vs {} req/s). Inspection cannot speed traffic up, "
+                    "so this is not a result: the run either did not inspect or was too "
+                    "short to separate from noise.".format(
+                        title, label, fmt(data["rps"]), fmt(reference["rps"])
+                    )
+                )
+
+            # Fail-closed turns "cannot inspect" into a flood of cheap blocked
+            # responses, which is fast for the same reason skipping inspection
+            # is fast. Either way the traffic never reached the backend.
+            if data["ok_ratio"] is not None and data["ok_ratio"] < 0.99:
+                warnings.append(
+                    "{}: only {:.1%} of {}'s requests reached the backend ({}); the rest "
+                    "were blocked, so its timings are the cost of rejecting traffic, not "
+                    "of inspecting and forwarding it.".format(
+                        title,
+                        data["ok_ratio"],
+                        label,
+                        ", ".join(
+                            "{}x {}".format(count, code) for code, count in sorted(data["codes"].items())
+                        ),
+                    )
+                )
 
             # An inspected column that inspected nothing is not a fast column.
             if data["inspecting_after"] == "no":
