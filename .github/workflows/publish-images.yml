@@ -1,0 +1,99 @@
+name: publish-images
+
+# Publishes the images that are not tied to a traefik version: the standalone
+# traefik daemon, and the admission webhook that injects it.
+on:
+  push:
+    branches:
+      - jclab-main
+    paths:
+      - "attachments/traefik/daemon/**"
+      - "attachments/nano_attachment/**"
+      - "core/**"
+      - "docker/openappsec-traefik/daemon.Dockerfile"
+      - "docker/openappsec-waf-webhook/**"
+      - ".github/workflows/publish-images.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Additional tag to publish (besides latest and the commit sha)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  traefik-daemon:
+    name: openappsec-traefik-daemon
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The daemon links the nano attachment C libraries through cgo, so each
+      # architecture is compiled natively under emulation rather than
+      # cross-compiled.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: tags
+        run: |
+          image="ghcr.io/${{ github.repository_owner }}/openappsec-traefik-daemon"
+          tags="${image}:latest,${image}:${GITHUB_SHA::12}"
+          if [ -n "${{ inputs.tag }}" ]; then
+            tags="${tags},${image}:${{ inputs.tag }}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/openappsec-traefik/daemon.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.tags }}
+          push: true
+
+  waf-webhook:
+    name: openappsec-waf-webhook
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: tags
+        run: |
+          image="ghcr.io/${{ github.repository_owner }}/openappsec-waf-webhook"
+          tags="${image}:latest,${image}:${GITHUB_SHA::12}"
+          if [ -n "${{ inputs.tag }}" ]; then
+            tags="${tags},${image}:${{ inputs.tag }}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/openappsec-waf-webhook
+          file: docker/openappsec-waf-webhook/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.tags }}
+          push: true

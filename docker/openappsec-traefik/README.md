@@ -79,3 +79,33 @@ http:
 See `attachments/traefik/README.md` for all plugin/daemon options. Traffic
 fails open while the agent is unavailable (set `failClose: true` on the
 middleware to invert this).
+
+## Running the daemon beside traefik instead
+
+`daemon.Dockerfile` builds the daemon on its own
+(`ghcr.io/jclab-oss/openappsec-traefik-daemon`, amd64 and arm64), for
+deployments that would rather keep the traefik image untouched and run the
+daemon next to it. The plugin still has to be loaded into traefik — that part
+cannot move — but everything cgo reaches for lives in this image.
+
+```bash
+docker buildx build -f docker/openappsec-traefik/daemon.Dockerfile \
+    --platform linux/amd64,linux/arm64 .
+```
+
+In Kubernetes it belongs in the traefik pod: containers in a pod share both the
+loopback address the plugin dials and the `/dev/shm` the agent communicates
+over, so the daemon needs no ports or volumes of its own. Label or annotate the
+pod and the admission webhook adds it:
+
+```yaml
+metadata:
+  labels:
+    attachment.openappsec.io/traefik: "true"
+```
+
+`docker/openappsec-waf-webhook` reads `TRAEFIK_DAEMON_IMAGE` and
+`TRAEFIK_DAEMON_TAG` for which image to inject, and passes through
+`CONCURRENCY_CALC` / `CONCURRENCY_NUMBER` (and the other daemon settings) if
+they are set on the webhook, each also overridable per-setting with a
+`TRAEFIK_` prefix.

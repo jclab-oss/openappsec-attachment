@@ -21,8 +21,17 @@ INIT_CONTAINER_IMAGE = os.getenv('INIT_CONTAINER_IMAGE', 'ghcr.io/openappsec/ope
 INIT_CONTAINER_TAG = os.getenv('INIT_CONTAINER_TAG', 'latest')
 ISTIOD_PORT = os.getenv('ISTIOD_PORT', '15014')
 RELEASE_NAMESPACE = os.getenv('K8S_NAMESPACE', 'envoy-gateway-system')
+TRAEFIK_DAEMON_IMAGE = os.getenv('TRAEFIK_DAEMON_IMAGE', 'ghcr.io/jclab-oss/openappsec-traefik-daemon')
+TRAEFIK_DAEMON_TAG = os.getenv('TRAEFIK_DAEMON_TAG', 'latest')
 FULL_AGENT_IMAGE = f"{AGENT_IMAGE}:{AGENT_TAG}"
 FULL_INIT_CONTAINER_IMAGE = f"{INIT_CONTAINER_IMAGE}:{INIT_CONTAINER_TAG}"
+FULL_TRAEFIK_DAEMON_IMAGE = f"{TRAEFIK_DAEMON_IMAGE}:{TRAEFIK_DAEMON_TAG}"
+
+# Pods asking for the traefik attachment carry this key, as a label or an
+# annotation. The traefik plugin itself is configured in traefik; all the pod
+# needs from the webhook is the daemon that plugin talks to.
+TRAEFIK_ATTACHMENT_KEY = 'attachment.openappsec.io/traefik'
+TRAEFIK_DAEMON_CONTAINER_NAME = 'openappsec-traefik-daemon'
 
 config.load_incluster_config()
 
@@ -161,6 +170,58 @@ def get_sidecar_container():
     app.logger.debug(f"Sidecar container spec: {sidecar}")
     app.logger.debug("Exiting get_sidecar_container()")
     return sidecar
+
+def wants_traefik_daemon(obj):
+    """Whether the pod asked for the traefik attachment.
+
+    Accepts the key as either a label or an annotation: which of the two a
+    chart reaches for varies, and both carry the same intent here.
+    """
+    metadata = obj.get('metadata', {})
+    for source in ('labels', 'annotations'):
+        value = (metadata.get(source) or {}).get(TRAEFIK_ATTACHMENT_KEY)
+        if value is not None and str(value).strip().lower() in ('true', 'yes', 'on', '1', 'enabled'):
+            app.logger.debug("Pod requested the traefik attachment via %s", source)
+            return True
+    return False
+
+def get_traefik_daemon_container():
+    """The daemon the traefik plugin talks to.
+
+    It needs no volumes: it reaches the agent through /dev/shm and the plugin
+    reaches it over the loopback address, both of which the pod's containers
+    already share. It runs as root because the shared memory the agent creates
+    is owned by root.
+    """
+    app.logger.debug("Entering get_traefik_daemon_container()")
+
+    env = []
+    for var_name in ('CONCURRENCY_CALC', 'CONCURRENCY_NUMBER', 'OPENAPPSEC_DAEMON_LISTEN',
+                     'OPENAPPSEC_ACQUIRE_TIMEOUT_MS', 'OPENAPPSEC_SESSION_TTL_SEC'):
+        var_value = os.getenv(f"TRAEFIK_{var_name}", os.getenv(var_name))
+        if var_value is not None:
+            env.append({"name": var_name, "value": var_value})
+
+    container = {
+        "name": TRAEFIK_DAEMON_CONTAINER_NAME,
+        "image": FULL_TRAEFIK_DAEMON_IMAGE,
+        "imagePullPolicy": "Always",
+        "env": env,
+        "securityContext": {
+            "runAsNonRoot": False,
+            "runAsUser": 0
+        },
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File"
+    }
+
+    daemon_cpu = os.getenv('TRAEFIK_DAEMON_CPU')
+    if daemon_cpu:
+        container["resources"] = {"requests": {"cpu": daemon_cpu}}
+
+    app.logger.debug(f"Traefik daemon container spec: {container}")
+    app.logger.debug("Exiting get_traefik_daemon_container()")
+    return container
 
 def get_istio_version():
     url = f"http://istiod.istio-system:{ISTIOD_PORT}/version"
@@ -777,6 +838,8 @@ def mutate():
     volumes = obj.get('spec', {}).get('volumes', [])
     app.logger.debug("Current containers in the pod: %s", json.dumps(containers, indent=2))
     sidecar_exists = any(container['name'] == 'open-appsec-nano-agent' for container in containers)
+    traefik_requested = wants_traefik_daemon(obj)
+    traefik_daemon_exists = any(container['name'] == TRAEFIK_DAEMON_CONTAINER_NAME for container in containers)
     init_container_exist = any(init_container['name'] == 'prepare-attachment' for init_container in init_containers)
     # Only check for envoy-attachment-shared volume if agent kind is Istio or Envoy Gateway
     volume_exist = any(volume['name'] == 'envoy-attachment-shared' for volume in volumes) if is_envoy_based_proxy_agent() else False
@@ -850,7 +913,8 @@ def mutate():
                 })
                 app.logger.debug("Set automountServiceAccountToken=false for kong agent removal")
 
-        if sidecar_exists:
+        if sidecar_exists or traefik_daemon_exists:
+            injected_indices = []
             for idx, container in enumerate(containers):
                 volume_mounts = container.get('volumeMounts', [])
                 if is_envoy_based_proxy_agent():
@@ -861,12 +925,17 @@ def mutate():
                                "path": f"/spec/containers/{idx}/volumeMounts/{idx_v}"
                             })
                             app.logger.debug(f"Removed volumeMount: {patches[-1]}")
-                if container['name'] == 'open-appsec-nano-agent':
-                    patches.append({
-                       "op": "remove",
-                       "path": f"/spec/containers/{idx}"
-                    })
-                    app.logger.debug(f"Removed sidecar container patch: {patches[-1]}")
+                if container['name'] in ('open-appsec-nano-agent', TRAEFIK_DAEMON_CONTAINER_NAME):
+                    injected_indices.append(idx)
+
+            # Highest index first: the patches are applied in order, so removing
+            # a lower index would shift the ones still to come.
+            for idx in sorted(injected_indices, reverse=True):
+                patches.append({
+                   "op": "remove",
+                   "path": f"/spec/containers/{idx}"
+                })
+                app.logger.debug(f"Removed injected container patch: {patches[-1]}")
 
         if volume_exist:
             for idx, volume in enumerate(volumes):
@@ -990,6 +1059,37 @@ def mutate():
                             "value": FULL_AGENT_IMAGE
                         })
                         app.logger.debug(f"Updated sidecar image patch: {patches[-1]}")
+                    break
+
+        if traefik_requested:
+            if not traefik_daemon_exists:
+                patches.append({
+                    "op": "add",
+                    "path": "/spec/containers/-",
+                    "value": get_traefik_daemon_container()
+                })
+                app.logger.debug("Added traefik daemon container patch: %s", patches[-1])
+            else:
+                for idx, container in enumerate(containers):
+                    if container['name'] == TRAEFIK_DAEMON_CONTAINER_NAME:
+                        current_image = container.get('image', '')
+                        if current_image != FULL_TRAEFIK_DAEMON_IMAGE:
+                            patches.append({
+                                "op": "replace",
+                                "path": f"/spec/containers/{idx}/image",
+                                "value": FULL_TRAEFIK_DAEMON_IMAGE
+                            })
+                            app.logger.debug(f"Updated traefik daemon image patch: {patches[-1]}")
+                        break
+        elif traefik_daemon_exists:
+            # The pod stopped asking for it, so take it back out.
+            for idx, container in enumerate(containers):
+                if container['name'] == TRAEFIK_DAEMON_CONTAINER_NAME:
+                    patches.append({
+                        "op": "remove",
+                        "path": f"/spec/containers/{idx}"
+                    })
+                    app.logger.debug(f"Removed traefik daemon container patch: {patches[-1]}")
                     break
 
         if is_envoy_based_proxy_agent() and init_container_exist:
