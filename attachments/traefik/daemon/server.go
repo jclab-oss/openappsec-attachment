@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // startRequest mirrors the JSON sent by the traefik plugin when a request starts.
@@ -76,7 +77,15 @@ func (s *Server) Serve(listenAddr string) error {
 		return err
 	}
 	log.Printf("openappsec traefik daemon listening on %s", listenAddr)
-	return http.Serve(listener, s.mux)
+	// The plugin keeps a pool of connections to this server and reuses them for
+	// every inspection call, so idle connections must not be reaped faster than
+	// the plugin recycles them; a short idle timeout would put the churn the
+	// pool exists to avoid right back into the hot path.
+	server := &http.Server{
+		Handler:     s.mux,
+		IdleTimeout: 120 * time.Second,
+	}
+	return server.Serve(listener)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
