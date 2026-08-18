@@ -1,0 +1,18 @@
+# Base compose for the traefik attachment e2e tests: traefik (with the
+# open-appsec plugin + daemon) in front of a whoami backend, without an agent.
+# In this setup the attachment must fail open (all traffic forwarded).
+services:
+  traefik:
+    image: ${OPENAPPSEC_TRAEFIK_IMAGE:-openappsec-traefik:test}
+    ports:
+      - "8080:80"
+    volumes:
+      - ./dynamic.yml:/etc/traefik/dynamic.yml:ro
+    command:
+      - --entrypoints.web.address=:80
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --log.level=DEBUG
+      - --api.insecure=false
+
+  whoami:
+    image: traefik/whoami:latest

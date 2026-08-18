@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Benchmarks the cost of inspection: one traefik instance serves the same
+# backend on two entrypoints, with the middleware on :80 and without it on :81,
+# so the difference between them is the attachment and nothing else.
+#
+# The result is written as a markdown table to stdout and, when running in
+# GitHub Actions, appended to the job summary.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+APPSEC_URL=${APPSEC_URL:-http://127.0.0.1:8080}
+BASELINE_URL=${BASELINE_URL:-http://127.0.0.1:8081}
+# Measured over a fixed duration, not a fixed request count: at a few thousand
+# requests per second a couple of thousand requests is a third of a second, and
+# run-to-run noise at that length reached 15% — enough to make an inspected run
+# look faster than an uninspected one.
+DURATION=${BENCH_DURATION:-20s}
+CONCURRENCY=${BENCH_CONCURRENCY:-20}
+WARMUP_DURATION=${BENCH_WARMUP_DURATION:-5s}
+OHA_IMAGE=${OHA_IMAGE:-ghcr.io/hatoo/oha:latest}
+READY_TIMEOUT_SEC=${READY_TIMEOUT_SEC:-420}
+POST_BODY="name=john&city=seoul&comment=hello+from+the+benchmark"
+RESULT_DIR=$(mktemp -d)
+
+compose() {
+    if docker compose version >/dev/null 2>&1; then
+        docker compose -f docker-compose.bench.yml "$@"
+    else
+        docker-compose -f docker-compose.bench.yml "$@"
+    fi
+}
+
+cleanup() {
+    compose down -v --remove-orphans >/dev/null 2>&1 || true
+    rm -rf "$RESULT_DIR"
+}
+trap cleanup EXIT
+
+# oha <output-name> <url> <method> [body]
+run_case() {
+    local name=$1 url=$2 method=$3 body=${4:-}
+    local args=(--no-tui -c "$CONCURRENCY" -m "$method" --disable-keepalive)
+    if [ -n "$body" ]; then
+        args+=(-d "$body" -H "Content-Type: application/x-www-form-urlencoded")
+    fi
+
+    # Warm up so start-up costs do not skew the measurement. Yaegi in
+    # particular is slowest on the first calls through a handler.
+    docker run --rm --network host "$OHA_IMAGE" \
+        --output-format quiet -z "$WARMUP_DURATION" "${args[@]}" "$url" >/dev/null 2>&1 || true
+
+    docker run --rm --network host "$OHA_IMAGE" \
+        --output-format json -z "$DURATION" "${args[@]}" "$url" > "$RESULT_DIR/$name.json"
+}
+
+wait_for_traefik() {
+    local i
+    for i in $(seq 1 30); do
+        if curl -fsS -o /dev/null "$BASELINE_URL/" && curl -fsS -o /dev/null "$APPSEC_URL/"; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "FAIL: traefik did not start"
+    return 1
+}
+
+# Inspecting means the middleware tells the two apart. Checking only that an
+# attack is blocked would also pass when everything is blocked, which is what
+# fail-closed does when it cannot reach the daemon at all.
+is_inspecting() {
+    local attack benign
+    attack=$(curl -s -o /dev/null -w '%{http_code}' "$APPSEC_URL/?file=../../../../etc/passwd" || echo 000)
+    benign=$(curl -s -o /dev/null -w '%{http_code}' "$APPSEC_URL/" || echo 000)
+    [ "$attack" = "403" ] && [ "$benign" = "200" ]
+}
+
+# The inspected numbers only mean something once the agent actually inspects.
+# Before registration and policy load finish, a fail-closed middleware blocks
+# everything and a fail-open one forwards everything; neither is a measurement
+# of inspection.
+wait_for_inspection() {
+    local start
+    start=$(date +%s)
+    while [ $(( $(date +%s) - start )) -lt "$READY_TIMEOUT_SEC" ]; do
+        if is_inspecting; then
+            return 0
+        fi
+        sleep 5
+    done
+    echo "FAIL: the attachment never started inspecting; benchmark would be meaningless"
+    return 1
+}
+
+# Load itself can switch inspection off — the agent sheds it, or the middleware
+# fails open when the daemon cannot keep up. Checking only before the run would
+# report the cost of not inspecting as the cost of inspecting, so the state
+# after the run is recorded and surfaced in the report.
+record_inspection_state() {
+    local name=$1
+    if is_inspecting; then
+        echo yes > "$RESULT_DIR/$name.inspecting"
+    else
+        echo no > "$RESULT_DIR/$name.inspecting"
+        echo "    NOTE: inspection was no longer active after this run"
+    fi
+}
+
+# One failed daemon call opens the fail-open window for errorBackoffMs, which
+# is long enough to swallow a whole measurement: at a few thousand requests per
+# second a 2 s window covers far more requests than the run itself. Counting
+# the failures around each run is what makes a contaminated measurement
+# impossible to mistake for a fast one.
+daemon_failures() {
+    compose logs "$1" 2>&1 | grep -c "daemon communication failure" || true
+}
+
+# How much inspection the agent actually asked for. A transaction it finalizes
+# on the first call costs one round trip; one it keeps inspecting costs a call
+# per body chunk and per response stage. That decision is the agent's and it
+# changes as the agent learns, so the count belongs next to the timings.
+#
+# Prints the counter, or nothing if it could not be read. A failed read must
+# not come back as a number: subtracting one from a reading taken earlier
+# produces a negative "count" that looks like data.
+daemon_stat() {
+    local service=$1 field=$2 attempt value
+    for attempt in 1 2 3; do
+        value=$(compose exec -T "$service" wget -q -O- http://127.0.0.1:8579/healthz 2>/dev/null |
+            python3 -c "import json,sys; print(json.load(sys.stdin)['$field'])" 2>/dev/null || true)
+        if [ -n "$value" ]; then
+            echo "$value"
+            return 0
+        fi
+        sleep 1
+    done
+}
+measure() {
+    local service=traefik scenario method body path
+    local failures_before failures_after chunks_before chunks_after
+    local rejected_before rejected_after
+
+    compose up -d appsec-agent whoami "$service"
+    wait_for_traefik
+    wait_for_inspection
+    echo "Attachment is inspecting."
+
+    for scenario in get post; do
+        case "$scenario" in
+            get)  method=GET;  body="";           path="/" ;;
+            post) method=POST; body="$POST_BODY"; path="/form" ;;
+        esac
+        echo "  - $scenario without the attachment"
+        run_case "${scenario}-baseline" "$BASELINE_URL$path" "$method" "$body"
+
+        echo "  - $scenario with the attachment"
+        failures_before=$(daemon_failures "$service")
+        chunks_before=$(daemon_stat "$service" chunksSent)
+        rejected_before=$(daemon_stat "$service" transactionsRejected)
+        run_case "${scenario}-appsec" "$APPSEC_URL$path" "$method" "$body"
+        chunks_after=$(daemon_stat "$service" chunksSent)
+        rejected_after=$(daemon_stat "$service" transactionsRejected)
+        failures_after=$(daemon_failures "$service")
+
+        # Transactions that waited out the queue and went uninspected: the
+        # daemon is at capacity, which is a fact about the load, not the run.
+        if [ -n "$rejected_before" ] && [ -n "$rejected_after" ] &&
+            [ "$rejected_after" -gt "$rejected_before" ]; then
+            echo "$(( rejected_after - rejected_before ))" > "$RESULT_DIR/${scenario}-appsec.rejected"
+        fi
+        record_inspection_state "${scenario}-appsec"
+
+        if [ -n "$chunks_before" ] && [ -n "$chunks_after" ]; then
+            echo "$(( chunks_after - chunks_before ))" > "$RESULT_DIR/${scenario}-appsec.chunks"
+        else
+            echo "    NOTE: could not read the daemon's inspection counters for this run"
+        fi
+        echo "$(( failures_after - failures_before ))" > "$RESULT_DIR/${scenario}-appsec.failures"
+    done
+
+    # Record the sizing the numbers were produced with: a transaction holds one
+    # attachment, so this is how much inspection could run at once.
+    compose logs "$service" 2>&1 |
+        grep -o 'starting with [0-9]* attachment workers' | head -1 |
+        grep -o '[0-9]*' > "$RESULT_DIR/workers" || true
+}
+
+echo "Running benchmark: ${DURATION} per case, concurrency ${CONCURRENCY}"
+measure
+
+echo "Building the report..."
+export BENCH_CPUS="$(nproc)"
+export BENCH_WORKERS="$(cat "$RESULT_DIR/workers" 2>/dev/null || echo unknown)"
+report=$(python3 report_benchmark.py "$RESULT_DIR" "$DURATION" "$CONCURRENCY")
+echo "$report"
+
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    echo "$report" >> "$GITHUB_STEP_SUMMARY"
+fi

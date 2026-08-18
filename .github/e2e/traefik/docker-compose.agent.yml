@@ -1,0 +1,27 @@
+# Overlay that adds the open-appsec agent (declarative/standalone mode) and
+# shares its IPC namespace (/dev/shm) with the traefik container.
+services:
+  appsec-agent:
+    image: ghcr.io/openappsec/agent:latest
+    container_name: appsec-agent
+    ipc: shareable
+    environment:
+      - user_email=e2e-test@openappsec.io
+      - registered_server=Traefik Server
+      - autoPolicyLoad=true
+    volumes:
+      - appsec-config:/etc/cp/conf
+      - appsec-data:/etc/cp/data
+      - appsec-logs:/var/log/nano_agent
+      - ./appsec-localconfig:/ext/appsec
+    command: /cp-nano-agent
+
+  traefik:
+    ipc: service:appsec-agent
+    depends_on:
+      - appsec-agent
+
+volumes:
+  appsec-config:
+  appsec-data:
+  appsec-logs:
