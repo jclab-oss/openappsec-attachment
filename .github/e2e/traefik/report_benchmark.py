@@ -60,6 +60,7 @@ def main():
     ]
 
     degraded = []
+    saturated = []
     for key, title, note in SCENARIOS:
         before = load(result_dir, key + "-baseline")
         after = load(result_dir, key + "-appsec")
@@ -99,8 +100,31 @@ def main():
                 "{}: success rate with the attachment is {:.1%}".format(title, after["success_rate"])
             )
 
+        # Once the agent's inspection pipeline saturates, tail latency grows by
+        # orders of magnitude while the mean stays reasonable. Call that out so
+        # a saturated run is not misread as a per-request cost.
+        if (
+            before["p99"] is not None
+            and after["p99"] is not None
+            and before["p99"] > 0
+            and after["p99"] / before["p99"] >= 10
+        ):
+            saturated.append(
+                "{}: p99 is {:.0f}x the baseline ({} vs {}), which means inspection is "
+                "saturated at this concurrency rather than costing that much per "
+                "request; lower the concurrency or raise the attachment worker count "
+                "to measure the per-request cost.".format(
+                    title,
+                    after["p99"] / before["p99"],
+                    fmt(after["p99"], " ms"),
+                    fmt(before["p99"], " ms"),
+                )
+            )
+
     if degraded:
         lines += ["> [!WARNING]"] + ["> " + item for item in degraded] + [""]
+    if saturated:
+        lines += ["> [!NOTE]"] + ["> " + item for item in saturated] + [""]
 
     print("\n".join(lines))
 
