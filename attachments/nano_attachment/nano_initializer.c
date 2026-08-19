@@ -18,6 +18,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <dirent.h>
+#include <limits.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -507,6 +508,35 @@ set_docker_id(NanoAttachment *attachment)
             strncpy(attachment->container_id, env_value, MAX_CONTAINER_ID_LEN - 1);
             attachment->container_id[MAX_CONTAINER_ID_LEN - 1] = '\0';
             uid_read = true;
+        }
+    }
+
+    if (!uid_read) {
+        // Under cgroup v2 the file holds only "0::/", so there is no container
+        // id in it to find. Without one the unique id degrades to the worker
+        // index, and two attachments sharing an agent then claim the same
+        // shared memory and socket: the later one takes them over and the
+        // earlier one is left reconnecting to a queue that is no longer its
+        // own. The hostname stands in — docker sets it to the container id,
+        // kubernetes to the pod name — which is what distinguishes them.
+        // Sized well past MAX_CONTAINER_ID_LEN on purpose: gethostname fails
+        // rather than truncates when the name does not fit, and docker's
+        // default hostname is a 12 character container id — exactly the width
+        // of the field it ends up in.
+        char hostname[HOST_NAME_MAX + 1];
+        if (gethostname(hostname, sizeof(hostname)) == 0 && hostname[0] != '\0') {
+            hostname[sizeof(hostname) - 1] = '\0';
+            strncpy(attachment->container_id, hostname, MAX_CONTAINER_ID_LEN - 1);
+            attachment->container_id[MAX_CONTAINER_ID_LEN - 1] = '\0';
+            uid_read = true;
+            write_dbg(
+                attachment,
+                0,
+                DBG_LEVEL_DEBUG,
+                "No container id in %s; identifying this attachment by hostname '%s'",
+                CONTAINER_ID_FILE_PATH,
+                attachment->container_id
+            );
         }
     }
 
