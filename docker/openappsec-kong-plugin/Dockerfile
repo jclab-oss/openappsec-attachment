@@ -1,4 +1,10 @@
-FROM kong
+# Kong with the open-appsec plugin.
+#
+# Build from the repository root:
+#   docker build -f docker/openappsec-kong-plugin/Dockerfile --build-arg KONG_BASE=kong .
+ARG KONG_BASE=kong
+
+FROM ${KONG_BASE}
 
 USER root
 
@@ -15,8 +21,18 @@ RUN curl -sL https://github.com/USCiLab/cereal/archive/refs/tags/v1.3.2.tar.gz |
 # Create attachment-metadata file
 RUN echo "EFFECTIVE_SHM_SEGMENT_SIZE=4096" > /etc/attachment-metadata
 
-# Install the plugin via LuaRocks
-RUN luarocks install https://raw.githubusercontent.com/openappsec/attachment/main/attachments/kong/plugins/open-appsec-waf-kong-plugin/open-appsec-waf-kong-plugin-1.0.0-1.rockspec
+# Build the plugin from this checkout. `luarocks install <url>` would fetch the
+# published rockspec instead, which pins its own source and would leave the
+# image without whatever this tree changed — including the C sources the
+# rockspec compiles into the plugin. The module paths in the rockspec are
+# relative to the repository root, so the build runs from there.
+COPY attachments /src/attachments
+COPY core /src/core
+COPY external /src/external
+
+RUN cd /src && \
+    luarocks make attachments/kong/plugins/open-appsec-waf-kong-plugin/open-appsec-waf-kong-plugin-1.0.0-1.rockspec && \
+    rm -rf /src
 
 USER kong
 

@@ -1,22 +1,33 @@
 name: publish-images
 
-# Publishes the images that are not tied to a traefik version: the standalone
-# traefik daemon, and the admission webhook that injects it.
+# Publishes the images that are not tied to a proxy version: the standalone
+# traefik daemon, the admission webhook that injects it, and kong with the
+# plugin built in.
 on:
   push:
     branches:
       - jclab-main
     paths:
-      - "attachments/traefik/daemon/**"
-      - "attachments/nano_attachment/**"
+      - "attachments/**"
       - "core/**"
+      - "external/**"
       - "docker/openappsec-traefik/daemon.Dockerfile"
       - "docker/openappsec-waf-webhook/**"
+      - "docker/openappsec-kong-plugin/**"
+      - "docker/openappsec-kong-gateway-plugin/**"
       - ".github/workflows/publish-images.yml"
+  # The kong images track kong's own releases, so they are rebuilt daily even
+  # when nothing here changed.
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       tag:
         description: "Additional tag to publish (besides latest and the commit sha)"
+        required: false
+        default: ""
+      kong_version:
+        description: "Kong version to build against (default: the newest published release)"
         required: false
         default: ""
 
@@ -27,6 +38,9 @@ permissions:
 jobs:
   traefik-daemon:
     name: openappsec-traefik-daemon
+    # Only kong is on the daily schedule; this image changes when this
+    # repository does.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,6 +79,7 @@ jobs:
 
   waf-webhook:
     name: openappsec-waf-webhook
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,5 +110,101 @@ jobs:
           context: docker/openappsec-waf-webhook
           file: docker/openappsec-waf-webhook/Dockerfile
           platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.tags }}
+          push: true
+
+  kong:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: openappsec-kong-plugin
+            dockerfile: docker/openappsec-kong-plugin/Dockerfile
+            base: kong
+            repository: library/kong
+          - image: openappsec-kong-gateway-plugin
+            dockerfile: docker/openappsec-kong-gateway-plugin/Dockerfile
+            base: kong/kong-gateway
+            repository: kong/kong-gateway
+    steps:
+      - uses: actions/checkout@v4
+
+      # The plugin's C module is compiled during the image build, so each
+      # architecture is built natively under emulation rather than
+      # cross-compiled.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Which kong release to build against. The newest one unless the run
+      # names a version, so the daily run picks up kong's releases on its own.
+      - name: Resolve the kong version
+        id: kong
+        env:
+          REQUESTED: ${{ inputs.kong_version }}
+          REPOSITORY: ${{ matrix.repository }}
+        run: |
+          version="$REQUESTED"
+          if [ -z "$version" ]; then
+            version=$(python3 - "$REPOSITORY" <<'PY'
+          import json, re, sys, urllib.request
+
+          repository = sys.argv[1]
+          url = ("https://hub.docker.com/v2/repositories/%s/tags"
+                 "?page_size=100&ordering=last_updated" % repository)
+          newest = None
+          # Version-only tags: the rest are variants (-ubuntu, -alpine, rc) and
+          # floating aliases that say nothing about which release this is.
+          for _ in range(5):
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  page = json.load(response)
+              for tag in page.get("results", []):
+                  name = tag.get("name", "")
+                  if re.fullmatch(r"\d+(\.\d+){2,3}", name):
+                      version = tuple(int(part) for part in name.split("."))
+                      if newest is None or version > newest[0]:
+                          newest = (version, name)
+              url = page.get("next")
+              if not url:
+                  break
+          if newest is None:
+              sys.exit("no version tags found for " + repository)
+          print(newest[1])
+          PY
+            )
+          fi
+          echo "Building against ${REPOSITORY}:${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Tags
+        id: tags
+        env:
+          VERSION: ${{ steps.kong.outputs.version }}
+        run: |
+          image="ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}"
+          # The kong version alone moves as this repository changes; pinning
+          # both is what makes a build reproducible.
+          tags="${image}:latest,${image}:${VERSION},${image}:${VERSION}-openappsec_${GITHUB_SHA::12}"
+          if [ -n "${{ inputs.tag }}" ]; then
+            tags="${tags},${image}:${{ inputs.tag }}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            KONG_BASE=${{ matrix.base }}:${{ steps.kong.outputs.version }}
           tags: ${{ steps.tags.outputs.tags }}
           push: true
